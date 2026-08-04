@@ -13,10 +13,9 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 
-<!-- PDF.js: reads/decrypts PDFs client-side -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-<!-- pdf-lib: rebuilds unlocked PDFs client-side -->
-<script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+<!-- @cantoo/pdf-lib: reads, decrypts (with a real password) and rebuilds PDFs client-side,
+     without rasterizing pages — text stays selectable/copyable. -->
+<script src="https://unpkg.com/@cantoo/pdf-lib@2.3.2/dist/pdf-lib.min.js"></script>
 <!-- JSZip: bundles multiple unlocked files into one download -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 
@@ -403,22 +402,8 @@
 
         <hr class="div">
 
-        <div class="field-label">Unlocking Quality Preset</div>
-        <p class="field-sub">Sets image resolution and format during open-password rendering decryption</p>
-        <div class="preset-row" id="presetRow">
-          <div class="preset-btn" data-scale="2">
-            <div class="p-name">STANDARD</div>
-            <div class="p-sub">2x Scale</div>
-          </div>
-          <div class="preset-btn active" data-scale="2.5">
-            <div class="p-name">HIGH</div>
-            <div class="p-sub">2.5x Sharp</div>
-          </div>
-          <div class="preset-btn" data-scale="3.5">
-            <div class="p-name">LOSSLESS</div>
-            <div class="p-sub">PNG Original</div>
-          </div>
-        </div>
+        <div class="field-label">Output Format</div>
+        <p class="field-sub">Text, fonts and vector content are decrypted and carried over as-is — pages are never re-rendered as images, so the unlocked PDF stays fully selectable, searchable and copyable.</p>
       </div>
 
       <div class="panel">
@@ -460,10 +445,10 @@
         <h2>Security Policy</h2>
         <p style="color:var(--muted);font-size:13.5px;line-height:1.65;margin:0 0 10px;">
           Every file selected in this tool is read and processed with the JavaScript already loaded in this page —
-          nothing is uploaded, streamed, or transmitted to any server. Owner-only restrictions are stripped by
-          rebuilding the file's cross-reference table locally; open (user) passwords are verified and decrypted
-          locally, then the pages are re-rendered at your chosen quality preset and reassembled into a fresh,
-          unencrypted PDF.
+          nothing is uploaded, streamed, or transmitted to any server. Owner-only restrictions and open (user)
+          passwords are both decrypted locally, and the original text, fonts, images and vector content are carried
+          over untouched into a fresh, unencrypted PDF — nothing is re-rendered as an image, so the file stays
+          selectable, searchable and copyable.
         </p>
         <p style="color:var(--muted);font-size:13.5px;line-height:1.65;margin:0;">
           Saved keyring passwords are stored only in this browser's local storage on this device, and are never
@@ -480,7 +465,7 @@
           </div>
           <div class="faq-card">
             <h3>Are open password protected files supported?</h3>
-            <p>Yes. If a file is fully encrypted with an open password, enter it and the tool decrypts the content locally, then re-renders each page at your selected Quality Preset before rebuilding a clean PDF.</p>
+            <p>Yes. If a file is fully encrypted with an open password, enter it and the tool decrypts the content locally and rebuilds a clean PDF straight from the original text, fonts and vectors — no page is ever turned into an image.</p>
           </div>
           <div class="faq-card">
             <h3>Is there a file or size limit?</h3>
@@ -522,7 +507,6 @@
 <script>
 (function(){
   "use strict";
-  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js".replace(".min.js",".worker.min.js");
   const { PDFDocument } = PDFLib;
 
   // ---------- theme ----------
@@ -562,7 +546,6 @@
   // ---------- state ----------
   let files = []; // {id, file, name, size, password, status, statusText, resultBytes, resultName}
   let keys = [];
-  let qualityScale = 2.5; // driven by preset buttons
   let totalMs = 0, totalPages = 0;
   const KEY_STORAGE = "aj-pdf-unlocker-keys";
 
@@ -583,7 +566,6 @@
   const keyInput = document.getElementById("keyInput");
   const addKeyBtn = document.getElementById("addKey");
   const keyListEl = document.getElementById("keyList");
-  const presetRow = document.getElementById("presetRow");
   const filesCountLabel = document.getElementById("filesCountLabel");
   const batchBar = document.getElementById("batchBar");
   const slotsLeft = document.getElementById("slotsLeft");
@@ -613,15 +595,6 @@
     };
     return '<svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">'+icons[name]+'</svg>';
   }
-
-  // ---------- quality preset ----------
-  presetRow.querySelectorAll(".preset-btn").forEach(btn => {
-    btn.onclick = () => {
-      presetRow.querySelectorAll(".preset-btn").forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-      qualityScale = parseFloat(btn.dataset.scale);
-    };
-  });
 
   // ---------- keyring ----------
   function saveKeys(){
@@ -800,88 +773,40 @@
   }
 
   // ---------- core unlock logic ----------
-  // Attempt fast-path (restriction-only / no user password): pdf-lib can load & re-save,
-  // which strips the encryption dictionary while preserving vector text.
-  async function tryFastPath(bytes){
-    const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
-    const out = await doc.save();
-    return { bytes: out, pageCount: doc.getPageCount() };
-  }
-
-  // Full decrypt path for user (open) passwords: use PDF.js to decrypt + render,
-  // then rebuild a clean PDF with pdf-lib from the rendered pages.
-  // NOTE: bytes.slice() below gives pdf.js its own copy of the buffer — pdf.js
-  // transfers the data ArrayBuffer to its worker via postMessage, which detaches
-  // it. Without the copy, a second read of the same `bytes` (e.g. a retry with
-  // another candidate password) throws "ArrayBuffer is detached".
-  async function decryptAndRasterize(bytes, password, onPage){
-    const loadingTask = pdfjsLib.getDocument({ data: bytes.slice(), password });
-    const pdf = await loadingTask.promise;
-    const outDoc = await PDFDocument.create();
-
-    for (let i = 1; i <= pdf.numPages; i++){
-      const page = await pdf.getPage(i);
-      const viewport = page.getViewport({ scale: qualityScale });
-      const canvas = document.createElement("canvas");
-      canvas.width = viewport.width; canvas.height = viewport.height;
-      const ctx = canvas.getContext("2d");
-      await page.render({ canvasContext: ctx, viewport }).promise;
-
-      const pngUrl = canvas.toDataURL("image/png");
-      const pngBytes = Uint8Array.from(atob(pngUrl.split(",")[1]), c => c.charCodeAt(0));
-      const img = await outDoc.embedPng(pngBytes);
-      const pageOut = outDoc.addPage([viewport.width, viewport.height]);
-      pageOut.drawImage(img, { x: 0, y: 0, width: viewport.width, height: viewport.height });
-
-      if (onPage) onPage(i, pdf.numPages);
-      canvas.width = 0; canvas.height = 0; // free memory
-    }
-    return { bytes: await outDoc.save(), pageCount: pdf.numPages };
-  }
-
-  async function needsPassword(bytes){
-    try {
-      // .slice() here too — same detached-buffer reason as above.
-      const task = pdfjsLib.getDocument({ data: bytes.slice(), password: "" });
-      await task.promise;
-      return false;
-    } catch (err){
-      if (err && err.name === "PasswordException") return true;
-      throw err;
-    }
-  }
-
+  // @cantoo/pdf-lib (a maintained fork of pdf-lib) can actually decrypt an
+  // encrypted PDF when given the correct password — it doesn't rasterize
+  // anything, so all text, fonts and vector content survive untouched and
+  // stay selectable/copyable in the output file.
+  //
+  // Owner-password-only files (permission restrictions, no open password)
+  // decrypt with an empty string "", since that's the password readers use
+  // internally for the "no open password" case — so we always try "" first.
+  //
+  // bytes.slice() is passed to .load() so each attempt gets its own copy of
+  // the buffer; some PDF parsers mutate/detach the buffer they're given, and
+  // slicing keeps the original `bytes` safe to reuse for the next candidate.
   async function unlockOne(f, candidatePasswords){
     const bytes = new Uint8Array(await f.file.arrayBuffer());
+    const seen = new Set();
+    const candidates = ["", ...candidatePasswords.filter(pw => pw !== undefined && pw !== null)];
 
-    let requiresPw;
-    try { requiresPw = await needsPassword(bytes); }
-    catch(e){ throw new Error("Failed to parse PDF document."); }
-
-    if (!requiresPw){
-      const out = await tryFastPath(bytes);
-      return { bytes: out.bytes, method: "fast", pageCount: out.pageCount };
-    }
-
-    // needs a user password — try candidates in order
-    const tried = [];
-    for (const pw of candidatePasswords){
-      if (!pw || tried.includes(pw)) continue;
-      tried.push(pw);
+    let lastErr = null;
+    for (const pw of candidates){
+      if (seen.has(pw)) continue;
+      seen.add(pw);
       try {
-        const out = await decryptAndRasterize(bytes, pw, (n, total) => {
-          f.statusText = `Decrypting… page ${n}/${total}`;
-          render();
-        });
-        return { bytes: out.bytes, method: "raster", pageCount: out.pageCount };
+        const doc = await PDFDocument.load(bytes.slice(), { password: pw, updateMetadata: false });
+        const out = await doc.save();
+        return { bytes: out, method: pw === "" ? "fast" : "decrypt", pageCount: doc.getPageCount() };
       } catch (err){
-        if (err && err.name === "PasswordException"){
-          continue; // wrong password, try next candidate
-        }
-        throw err;
+        lastErr = err;
+        continue; // wrong password (or not the right one) — try next candidate
       }
     }
-    throw Object.assign(new Error("Incorrect password. Please verify the password and try again."), { code: "PW" });
+    if (lastErr && /encrypt/i.test(String(lastErr.message || ""))){
+      throw Object.assign(new Error("Incorrect password. Please verify the password and try again."), { code: "PW" });
+    }
+    throw new Error(lastErr && lastErr.message ? lastErr.message : "Failed to parse PDF document.");
   }
 
   unlockAllBtn.onclick = async () => {
